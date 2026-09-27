@@ -19,10 +19,10 @@ for path in "$base" "$raw" "$latents" "$manifest" "$run"; do
     exit 2
   fi
 done
-[[ -f $base && -d $raw && -d $latents && -f $manifest ]] || {
-  echo "Missing checkpoint, raw ZIP directory, latent ZIP directory, or scenes.jsonl" >&2
-  exit 2
-}
+[[ -f $base ]] || { echo "Missing checkpoint: $base" >&2; exit 2; }
+[[ -d $raw ]] || { echo "Missing raw ZIP directory: $raw" >&2; exit 2; }
+[[ -d $latents ]] || { echo "Missing latent ZIP directory: $latents" >&2; exit 2; }
+[[ -f $manifest ]] || { echo "Missing scenes.jsonl: $manifest" >&2; exit 2; }
 [[ ! -e $run ]] || { echo "Run directory already exists: $run" >&2; exit 2; }
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3}
@@ -32,8 +32,11 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3}
 }
 export SANA_WM_STAGE1_NVFP4=0
 python_bin=${PYTHON_BIN:-python}
+command -v "$python_bin" >/dev/null || { echo "Missing Python: $python_bin" >&2; exit 2; }
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo"
+printf 'Python: %s\nModel: %s\nRaw: %s\nLatents: %s\nManifest: %s\nRun: %s\nGPU: %s\n' \
+  "$python_bin" "$base" "$raw" "$latents" "$manifest" "$run" "$CUDA_VISIBLE_DEVICES"
 mkdir -p "$run"
 
 "$python_bin" - "$base" "$raw" "$latents" "$manifest" "$run/settings.json" <<'PY'
