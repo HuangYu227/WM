@@ -696,6 +696,7 @@ class AssociativeTTTLedger(nn.Module):
         holdout: Optional[HoldoutBatch | ObservationBatch] = None,
         holdout_tolerance: float = 0.0,
         differentiable: bool = True,
+        trace_route: bool = False,
     ) -> tuple[AssociativeTTTState, dict[str, Any]]:
         """Propose one clean-chunk update and atomically commit it.
 
@@ -735,6 +736,10 @@ class AssociativeTTTLedger(nn.Module):
             "holdout_after": after_loss,
             "last_committed_chunk": chunk_id if accepted_commit else state.last_committed_chunk.detach().cpu().tolist(),
         }
+        if trace_route:
+            report.update(route_slot_ids=assignments.detach().cpu().tolist(),
+                          route_gamma=gamma.detach().cpu().tolist(),
+                          route_replaced=replace.detach().cpu().tolist())
         if not accepted_commit:
             return state.clone(detach=not differentiable), report
         if not differentiable:

@@ -2,7 +2,8 @@ import pytest
 import torch
 from types import SimpleNamespace
 
-from worldttt.data import validate_manifest, validate_episode
+from worldttt.data import (validate_manifest, validate_episode, require_requested_frames,
+                           require_vae_stride, native_frame_limit)
 
 
 def test_scene_split_cannot_leak_and_keys_are_unique():
@@ -40,3 +41,20 @@ def test_fixture_uses_model_dtype_for_camera_and_plucker():
     for key in ('latent', 'text', 'camera', 'plucker'):
         assert restored[key].dtype == torch.float32
     assert restored['episode_id'] == 'scene'
+
+
+def test_requested_horizon_rejects_short_latent_cache():
+    with pytest.raises(ValueError, match='requested 121'):
+        require_requested_frames(torch.zeros(128, 10, 2, 2), 121, 'research/short')
+    require_requested_frames(torch.zeros(128, 121, 2, 2), 121, 'research/long')
+
+
+def test_chunk_plucker_requires_eight_raw_frames_per_latent():
+    require_vae_stride(SimpleNamespace(vae_time_stride=8))
+    with pytest.raises(ValueError, match='stride 8'):
+        require_vae_stride(SimpleNamespace(vae_time_stride=4))
+
+
+def test_native_frame_limit_preserves_requested_latents_and_camera_horizon():
+    assert native_frame_limit(10) == 73
+    assert native_frame_limit(121) == 961

@@ -43,16 +43,31 @@ def validate_episode(sample):
         raise ValueError('Missing caption')
 
 
+def require_requested_frames(latent, frames, key):
+    if latent.ndim != 4 or latent.shape[1] < frames:
+        raise ValueError(f'{key}: requested {frames} contiguous latents, found {latent.shape[1]}')
+
+
+def require_vae_stride(native):
+    if native.vae_time_stride != 8:
+        raise ValueError('GRAIL chunk Plucker channels require VAE temporal stride 8')
+
+
+def native_frame_limit(frames):
+    # Native num_frames caps both streams. This raw-camera horizon is always
+    # longer than the requested latent horizon, so neither is truncated short.
+    return 1 + 8 * (frames - 1)
+
+
 class EpisodeDataset(Dataset):
     def __init__(self, native_config, manifest, split, frames=10):
         from diffusion.data.datasets.video.sana_wm_zip_latent_data import SanaWMZipLatentDataset
-        # Native num_frames truncates BOTH raw camera frames and latents. Leave
-        # it unset; only crop after camera resampling / Plucker construction.
-        options = dict(native_config, num_frames=None, return_chunk_plucker=True,
-                       data_repeat=1, shuffle_dataset=False, sort_dataset=True)
-        self.native = SanaWMZipLatentDataset(**options)
         if frames < 10:
             raise ValueError('Episode must contain at least 10 latent frames')
+        options = dict(native_config, num_frames=native_frame_limit(frames), return_chunk_plucker=True,
+                       data_repeat=1, shuffle_dataset=False, sort_dataset=True)
+        self.native = SanaWMZipLatentDataset(**options)
+        require_vae_stride(self.native)
         self.frames = frames
         rows = validate_manifest([json.loads(s) for s in Path(manifest).read_text(encoding='utf-8').splitlines() if s.strip()])
         lookup = {f'{x["dataset_name"]}/{x["key"]}': i for i, x in enumerate(self.native.dataset)}
@@ -72,7 +87,7 @@ class EpisodeDataset(Dataset):
                 raise ValueError(f'Missing measured camera metadata: {row["key"]}')
             cam_idx = sidecar['ids'].tolist().index(item['key'])
             start, count = map(int, sidecar['ranges'][cam_idx])
-            needed_pixels = 1 + 8 * (frames - 1)
+            needed_pixels = native_frame_limit(frames)
             if count < needed_pixels or start < 0 or start + count > len(sidecar['pose']):
                 raise ValueError(f'Need >={needed_pixels} valid camera frames: {row["key"]}')
             self.indices.append(i)
@@ -82,6 +97,7 @@ class EpisodeDataset(Dataset):
 
     def __getitem__(self, index):
         z, prompt, _, _, _, _, camera, plucker = self.native.getdata(self.indices[index])
+        require_requested_frames(z, self.frames, self.rows[index]['key'])
         sample = dict(latent=z[:, :self.frames], camera=camera[:self.frames], plucker=plucker[:, :self.frames],
                       prompt=prompt, key=self.rows[index]['key'])
         validate_episode(sample)

@@ -6,6 +6,7 @@ These tests do not measure pretrained video quality.
 import os
 import json
 import time
+import pytest
 os.environ.setdefault('GDN_DISABLE_COMPILE', '1')
 os.environ.setdefault('SANA_USE_LIGER', '0')
 os.environ.setdefault('DISABLE_XFORMERS', '1')
@@ -66,6 +67,7 @@ def test_real_sana_forward_and_outer_future_gradient(record_property):
     handles = [ctl.writer.address.register_forward_hook(capture('key')),
                ctl.writer.value.register_forward_hook(capture('value'))]
     result = module(**fixture())
+    assert result['variant_gate_mean'] == {}
     result['future'].backward()
     for handle in handles:
         handle.remove()
@@ -85,6 +87,36 @@ def test_real_sana_forward_and_outer_future_gradient(record_property):
     record_property('association_loss', float(result['association'].detach()))
     record_property('future_gradient_l1', json.dumps({name: float(p.grad.abs().sum())
         for name, p in ctl.named_parameters() if p.grad is not None}))
+
+
+def test_paired_future_query_uses_one_history_and_read_only_variants():
+    from worldttt.grail_train import GrailEpisodeModel
+    model = make_model()
+    ctl = attach(model)
+    module = GrailEpisodeModel(model, steps=2)
+    with torch.no_grad():
+        result = module(**fixture(), seed=42,
+                        query_variants=('ridge', 'no_read', 'prototype', 'shuffle_value'), record_trace=True)
+    assert set(result['variant_future']) == {'ridge', 'no_read', 'prototype', 'shuffle_value'}
+    torch.testing.assert_close(result['future'], result['variant_future']['ridge'])
+    assert all(torch.isfinite(loss) for loss in result['variant_future'].values())
+    assert ctl.state.update_count.tolist() == [2]
+    assert result['query_context'].call_counts == {i: 1 for i in (2, 3, 6, 7, 10, 11, 14, 15)}
+    assert result['variant_hook_counts']['no_read'] == result['variant_hook_counts']['ridge']
+    assert result['variant_gate_mean']['no_read'] == 0.
+    assert result['variant_gate_mean']['prototype'] == pytest.approx(result['variant_gate_mean']['ridge'])
+    assert result['variant_gate_mean']['shuffle_value'] == pytest.approx(result['variant_gate_mean']['ridge'])
+    assert result['variant_slot_coverage']['ridge'] > 0.
+    assert len(result['memory_trace']) == 2
+    assert all(row['committed'] and row['hook_counts'] == {i: 1 for i in (2, 3, 6, 7, 10, 11, 14, 15)}
+               for row in result['memory_trace'])
+    assert all(row['accepted'] == sum(slot['observations'] for slot in row['slots'])
+               for row in result['memory_trace'])
+    assert result['memory_trace'][1]['precision_delta_fro'] > 0.
+    assert result['query_input_fingerprint']
+    with torch.no_grad():
+        generated = module(**fixture(), generated=True, seed=42, query_variants=('ridge',), record_trace=True)
+    assert generated['query_input_fingerprint'] == result['query_input_fingerprint']
 
 
 def sampler(model, batch, cfg=2.):

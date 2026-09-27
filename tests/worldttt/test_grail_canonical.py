@@ -12,6 +12,27 @@ from worldttt.grail_native import (
     WRITER_LAYER, attach_grail_native, load_grail_adapter,
 )
 from worldttt.grail_network import GrailNetworkConfig
+from worldttt.grail_network import sparse_attention
+
+
+def test_sparse_attention_accepts_fp32_bias_with_bf16_queries(monkeypatch):
+    from torch.nn import functional as functional
+
+    original_attention = functional.scaled_dot_product_attention
+
+    def require_cuda_compatible_mask(q, k, v, *, attn_mask, **kwargs):
+        assert attn_mask.dtype == q.dtype
+        return original_attention(q, k, v, attn_mask=attn_mask, **kwargs)
+
+    monkeypatch.setattr(functional, 'scaled_dot_product_attention', require_cuda_compatible_mask)
+    q = torch.randn(1, 2, 8, dtype=torch.bfloat16)
+    k = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16)
+    v = torch.randn(1, 2, 3, 8, dtype=torch.bfloat16)
+    bias = torch.randn(1, 2, 3, dtype=torch.float32)
+    out = sparse_attention(q, k, v, bias, heads=2)
+    assert out.shape == q.shape
+    assert out.dtype == q.dtype
+    assert torch.isfinite(out).all()
 
 torch.set_num_threads(2)
 
@@ -104,6 +125,34 @@ def test_reader_uses_selected_history_values():
         ctl.state.cross = -ctl.state.cross
     altered = run(model, ctl.context('frozen'), x)
     assert not torch.allclose(original, altered)
+
+
+def test_query_read_variants_preserve_state_and_isolate_memory_content():
+    model, ctl = setup()
+    x = torch.randn(1, 8, 16)
+    clean = ctl.context(collect=True, chunk_id=0, real_frame_indices=(0, 1))
+    run(model, clean, x)
+    ctl.commit_clean(clean, 0)
+    state_before = ctl.state.fingerprint()
+    query_x = x + 0.2
+    outputs = {}
+    reads = {}
+    for variant in ('ridge', 'no_read', 'prototype', 'shuffle_value'):
+        context = ctl.context('frozen', chunk_id=1, read_variant=variant)
+        outputs[variant] = run(model, context, query_x)
+        reads[variant] = context.slot_reads[0]
+        assert context.call_counts == {i: 1 for i in TARGET_LAYERS}
+        assert ctl.state.fingerprint() == state_before
+    torch.testing.assert_close(outputs['no_read'], query_x, rtol=0, atol=0)
+    torch.testing.assert_close(reads['no_read'].values, torch.zeros_like(reads['no_read'].values))
+    assert not torch.equal(reads['ridge'].values, reads['prototype'].values)
+    assert not torch.equal(reads['ridge'].values, reads['shuffle_value'].values)
+    torch.testing.assert_close(reads['ridge'].ids, reads['shuffle_value'].ids, rtol=0, atol=0)
+    torch.testing.assert_close(reads['ridge'].scores, reads['shuffle_value'].scores, rtol=0, atol=0)
+    torch.testing.assert_close(reads['ridge'].uncertainty, reads['shuffle_value'].uncertainty, rtol=0, atol=0)
+    assert torch.isfinite(outputs['ridge']).all()
+    with pytest.raises(ValueError, match='read variant'):
+        ctl.context('frozen', read_variant='oracle')
 
 
 def test_incompatible_layout_partial_clean_and_replayed_writer_fail():

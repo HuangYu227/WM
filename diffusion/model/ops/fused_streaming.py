@@ -75,6 +75,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 from fla.modules import ShortConvolution
+from torch.utils import checkpoint as checkpoint_module
 
 from diffusion.model.nets.sana_camctrl_blocks import _prepare_ray_apply_fns
 from diffusion.model.ops.fused_cam_gdn import (
@@ -504,7 +505,7 @@ def _gdn_main_triton(
     return out, None, None
 
 
-def _cam_main_triton(
+def _cam_main_triton_impl(
     q_cam_trans: torch.Tensor,
     k_cam_trans: torch.Tensor,
     v_cam_trans: torch.Tensor,
@@ -645,6 +646,25 @@ def _cam_main_triton(
     # the (B, H, D, D) shape callers expect for the kv_cache slot.
     cam_S_kv_new = final_state.view(B, H, BLOCK_D, BLOCK_D)[:, :, :D, :D].contiguous()
     return out, cam_S_kv_new
+
+
+def _cam_main_triton(
+    q_cam_trans: torch.Tensor,
+    k_cam_trans: torch.Tensor,
+    v_cam_trans: torch.Tensor,
+    beta: torch.Tensor,
+    decay: torch.Tensor,
+    cam_S_kv_prev: torch.Tensor | None,
+    save_kv_cache: bool,
+    T: int,
+    S: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    args = (q_cam_trans, k_cam_trans, v_cam_trans, beta, decay,
+            cam_S_kv_prev, save_kv_cache, T, S)
+    if torch.is_grad_enabled() and any(t.requires_grad for t in args[:5]):
+        # Rematerialize the pure scan, not the stateful GRAIL hook or KV commit.
+        return checkpoint_module.checkpoint(_cam_main_triton_impl, *args, use_reentrant=False)
+    return _cam_main_triton_impl(*args)
 
 
 # ---------------------------------------------------------------------------

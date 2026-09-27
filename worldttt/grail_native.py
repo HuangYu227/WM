@@ -1,5 +1,5 @@
 """Native GRAIL: one canonical writer, one Ridge ledger, eight sparse readers."""
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
@@ -56,11 +56,11 @@ class GrailNativeController(nn.Module):
         self.hook_counts, self.metrics = {}, []
 
     def context(self, mode=None, *, collect=False, chunk_id=None, cfg_conditional_start=None,
-                real_frame_indices=(), sigma=None):
+                real_frame_indices=(), sigma=None, read_variant='ridge', gate_overrides=None):
         return GrailNativeContext(self, mode or self.mode, collect, chunk_id, cfg_conditional_start,
-                                  real_frame_indices, sigma)
+                                  real_frame_indices, sigma, read_variant, gate_overrides)
 
-    def commit_clean(self, context, chunk_id, *, holdout=None):
+    def commit_clean(self, context, chunk_id, *, holdout=None, trace_route=False):
         if context.controller is not self or context.mode != 'online' or not context.collect:
             raise ValueError('only this controller online clean context can commit')
         if context.invalid or context.committed or context.chunk_id != chunk_id:
@@ -68,7 +68,8 @@ class GrailNativeController(nn.Module):
         if set(context.call_counts) != set(TARGET_LAYERS) or len(context.observations) != 1:
             raise ValueError('clean pass requires eight reader layers and exactly one canonical writer')
         self.state, report = self.ledger.commit(self.state, context.observations[0], chunk_id,
-                                               holdout=holdout, differentiable=torch.is_grad_enabled())
+                                               holdout=holdout, differentiable=torch.is_grad_enabled(),
+                                               trace_route=trace_route)
         context.committed = True
         report.update(writer_layer=WRITER_LAYER, writer_observations=context.observations[0].keys.shape[1],
                       hook_counts=dict(context.call_counts))
@@ -92,11 +93,20 @@ class GrailNativeController(nn.Module):
 
 
 class GrailNativeContext:
-    def __init__(self, controller, mode, collect, chunk_id, cfg_conditional_start, real_frame_indices, sigma):
+    def __init__(self, controller, mode, collect, chunk_id, cfg_conditional_start, real_frame_indices, sigma,
+                 read_variant, gate_overrides):
         if mode not in {'off', 'frozen', 'online'} or (collect and (mode != 'online' or chunk_id is None)):
             raise ValueError('invalid GRAIL context mode/clean collection')
+        if read_variant not in {'ridge', 'no_read', 'prototype', 'shuffle_value'}:
+            raise ValueError('unknown GRAIL read variant')
+        if read_variant != 'ridge' and (mode != 'frozen' or collect):
+            raise ValueError('experimental read variant requires frozen read-only context')
+        if gate_overrides is not None and (mode != 'frozen' or collect):
+            raise ValueError('gate overrides require frozen read-only context')
         self.controller, self.mode, self.collect, self.chunk_id = controller, mode, collect, chunk_id
         self.cfg_conditional_start, self.real_frame_indices, self.sigma = cfg_conditional_start, real_frame_indices, sigma
+        self.read_variant = read_variant
+        self.gate_overrides = gate_overrides
         self.call_counts, self.observations, self.gates = {}, [], {}
         self.committed = self.invalid = False
         self.slot_reads = None
@@ -138,6 +148,29 @@ class GrailNativeContext:
             pairs = [(keys, geometry)] if cfg is None else list(zip(keys.split(cfg), geometry.split(cfg)))
             self.slot_reads = [ctl.ledger.read_slots(state, q, g, chunk_id=self.chunk_id, block_size=ctl.network.query_block)
                                for q, g in pairs]
+            if self.read_variant == 'shuffle_value':
+                read_state = state.clone(detach=True)
+                for bi in range(state.batch_size):
+                    occupied = state.valid[bi].nonzero(as_tuple=True)[0]
+                    if len(occupied) < 2:
+                        raise ValueError('shuffle_value needs at least two occupied memory slots')
+                    source = occupied.roll(1)
+                    read_state.cross[bi, occupied] = state.cross[bi, source]
+                    read_state.precision[bi, occupied] = state.precision[bi, source]
+                wrong = [ctl.ledger.read_slots(read_state, q, g, chunk_id=self.chunk_id,
+                                               block_size=ctl.network.query_block) for q, g in pairs]
+                self.slot_reads = [replace(original, values=altered.values)
+                                   for original, altered in zip(self.slot_reads, wrong)]
+            if self.read_variant in {'no_read', 'prototype'}:
+                changed = []
+                for slots in self.slot_reads:
+                    if self.read_variant == 'no_read':
+                        values = torch.zeros_like(slots.values)
+                    else:
+                        batch = torch.arange(state.batch_size, device=x.device)[:, None, None]
+                        values = state.values[batch, slots.ids.clamp_min(0)] * slots.valid[..., None]
+                    changed.append(replace(slots, values=values))
+                self.slot_reads = changed
             if self.collect:
                 start = cfg or 0
                 confidence = ctl.writer.confidence(z[start:], visibility[start:], real[start:], self.slot_reads[-1], values[start:])
@@ -146,6 +179,9 @@ class GrailNativeContext:
                                                            confidence[:, ids], real[start:, ids]))
         if self.slot_reads is None:
             raise ValueError('canonical writer layer must execute before readers')
+        if self.read_variant == 'no_read':
+            self.gates[layer] = x.new_zeros(b, n, 1)
+            return x
         sigma = torch.as_tensor(0. if self.sigma is None else self.sigma, device=x.device, dtype=x.dtype)
         if sigma.numel() == 1:
             sigma = sigma.expand(b, n, 1)
@@ -154,8 +190,10 @@ class GrailNativeContext:
         features = [x] if cfg is None else x.split(cfg)
         times = [sigma] if cfg is None else sigma.split(cfg)
         masks = [visibility] if cfg is None else visibility.split(cfg)
-        results = [ctl.readers[str(layer)](h, slots, time, mask)
-                   for h, slots, time, mask in zip(features, self.slot_reads, times, masks)]
+        override = None if self.gate_overrides is None else self.gate_overrides[layer]
+        overrides = [None] * len(features) if override is None else ([override] if cfg is None else override.split(cfg))
+        results = [ctl.readers[str(layer)](h, slots, time, mask, gate_override=gate)
+                   for h, slots, time, mask, gate in zip(features, self.slot_reads, times, masks, overrides)]
         output = torch.cat([r[0] for r in results], 0)
         self.gates[layer] = torch.cat([r[1] for r in results], 0)
         if not torch.isfinite(output).all():

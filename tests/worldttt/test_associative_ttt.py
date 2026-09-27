@@ -35,6 +35,21 @@ def test_replacement_within_one_chunk_discards_superseded_instance_statistics():
     assert report['accepted'] == 1
 
 
+def test_optional_route_trace_reports_only_final_accepted_assignments():
+    cfg = AssociativeTTTConfig(key_dim=2, value_dim=1, geometry_dim=1, capacity=1, topk=1,
+                               merge_threshold=1.5)
+    ledger = AssociativeTTTLedger(cfg)
+    obs = ObservationBatch(torch.eye(2)[None], torch.tensor([[[9.], [2.]]]), torch.zeros(1, 2, 1),
+                           torch.ones(1, 2), torch.ones(1, 2, dtype=torch.bool))
+    state = ledger.new_state('route-trace')
+    _, ordinary = ledger.commit(state, obs, 0)
+    _, traced = ledger.commit(state, obs, 0, trace_route=True)
+    assert 'route_slot_ids' not in ordinary
+    assert traced['route_slot_ids'] == [[-1, 0]]
+    assert traced['route_gamma'] == [[0., 1.]]
+    assert traced['route_replaced'] == [[True]]
+
+
 def test_new_slot_matches_full_ridge_numpy_reference():
     cfg = AssociativeTTTConfig(
         key_dim=2, value_dim=2, geometry_dim=1, capacity=2, topk=1,

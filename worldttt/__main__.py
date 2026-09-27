@@ -10,13 +10,20 @@ def main():
     parser = argparse.ArgumentParser(description='WorldTTT v1: ordinary causal SANA with episode adaptation')
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('doctor', help='Report installed runtime and CUDA availability')
-    for name in ('train', 'grail-train', 'infer', 'evaluate', 'fixture', 'check-cache', 'query-eval', 'check-data'):
+    for name in ('train', 'grail-train', 'grail-experiment', 'infer', 'evaluate', 'fixture', 'check-cache', 'query-eval', 'check-data'):
         cmd = commands.add_parser(name)
         cmd.add_argument('--settings', required=True, help='JSON run settings')
         if name != 'check-data':
             cmd.add_argument('--output', required=True)
-        if name in {'train', 'grail-train', 'infer', 'evaluate', 'query-eval'}:
-            cmd.add_argument('--adapter')
+        if name in {'train', 'grail-train', 'grail-experiment', 'infer', 'evaluate', 'query-eval'}:
+            cmd.add_argument('--adapter', required=name == 'grail-experiment')
+        if name == 'grail-experiment':
+            cmd.add_argument('--split', choices=['val', 'test'], default='val')
+            cmd.add_argument('--samples', type=int, default=4, help='One clip from each of this many scenes')
+            cmd.add_argument('--frames', type=int, help='Exact latent-frame count; at least 10')
+            cmd.add_argument('--histories', nargs='+', choices=['real', 'generated'], default=['real'])
+            cmd.add_argument('--variants', nargs='+', choices=['ridge', 'no_read', 'prototype', 'shuffle_value'],
+                             default=['ridge', 'no_read', 'prototype', 'shuffle_value'])
         if name == 'infer':
             cmd.add_argument('--resume', help='Complete chunk-boundary rollout.pt checkpoint')
             cmd.add_argument('--case', required=True)
@@ -56,6 +63,10 @@ def main():
     if args.command == 'grail-train':
         from .grail_train import train
         train(settings, args.output, args.adapter)
+    elif args.command == 'grail-experiment':
+        from .grail_experiment import run_experiment
+        run_experiment(settings, args.adapter, args.output, split=args.split, samples=args.samples,
+                       frames=args.frames, histories=args.histories, variants=args.variants)
     elif args.command == 'train':
         from .check_cache import require_gate
         from .train import train
@@ -78,7 +89,7 @@ def main():
                        args.histories, args.modes)
     else:
         from .data import EpisodeDataset
-        data = EpisodeDataset(settings['data'], settings['manifest'], args.split)
+        data = EpisodeDataset(settings['data'], settings['manifest'], args.split, frames=settings.get('frames', 10))
         if args.command == 'check-data':
             for i in range(len(data)):
                 data[i]

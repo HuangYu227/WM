@@ -1,6 +1,7 @@
 """Canonical GRAIL outer training: support association + read-only future flow."""
 import json
 import os
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import torch
 from torch import nn
 
 from .grail_native import GrailNativeController, attach_grail_native, load_grail_adapter
+from .grail_resume import input_fingerprint
 from .grail_network import GrailNetworkConfig
 from .associative_ttt import AssociativeTTTConfig
 from .runtime import clone_cache
@@ -22,6 +24,30 @@ def chunk_boundaries(frames, chunk_size=3):
     return boundaries
 
 
+def _memory_trace_row(before, after, observation, report):
+    """Describe committed routing without treating slot reuse as instance truth."""
+    assignments = report['route_slot_ids']
+    gamma = report['route_gamma']
+    replaced = report['route_replaced']
+    source = observation.source_real.detach().cpu().bool().tolist()
+    slots = []
+    for bi, ids in enumerate(assignments):
+        counts = Counter(slot for slot in ids if slot >= 0)
+        for slot, count in sorted(counts.items()):
+            chosen = [i for i, assigned in enumerate(ids) if assigned == slot]
+            slots.append(dict(batch=bi, slot=slot, generation=int(after.generation[bi, slot]),
+                              observations=count, weight_sum=sum(gamma[bi][i] for i in chosen),
+                              real_observations=sum(source[bi][i] for i in chosen),
+                              preexisting=bool(before.valid[bi, slot]), replaced=bool(replaced[bi][slot])))
+    return dict(chunk_id=report['chunk_id'], committed=report['committed'],
+                accepted=report['accepted'], rejected_confidence=report['rejected_confidence'],
+                rejected_protected=report['rejected_protected'], replaced_events=report['replaced'],
+                occupied_slots=int(after.valid.sum()),
+                precision_delta_fro=float(torch.linalg.vector_norm(after.precision.detach() - before.precision.detach())),
+                cross_delta_fro=float(torch.linalg.vector_norm(after.cross.detach() - before.cross.detach())),
+                hook_counts=report['hook_counts'], slots=slots)
+
+
 class GrailEpisodeModel(nn.Module):
     def __init__(self, backbone, *, steps=4, flow_shift=9.8, association_weight=1., detach_every=0):
         super().__init__()
@@ -33,12 +59,18 @@ class GrailEpisodeModel(nn.Module):
     def controller(self):
         return self.backbone.worldttt_grail_controller
 
-    def forward(self, latent, camera, text, mask, episode_id, plucker=None, generated=False, seed=0):
+    def forward(self, latent, camera, text, mask, episode_id, plucker=None, generated=False, seed=0,
+                query_variants=('ridge',), record_trace=False):
         from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
         from diffusers import FlowMatchEulerDiscreteScheduler
         ctl, model = self.controller, self.backbone
         if latent.ndim != 5 or camera.shape[:2] != (latent.shape[0], latent.shape[2]):
             raise ValueError('trajectory needs latent [B,C,T,H,W] and camera [B,T,20]')
+        query_variants = tuple(query_variants)
+        if 'ridge' not in query_variants or len(set(query_variants)) != len(query_variants):
+            raise ValueError('query variants must be unique and include ridge')
+        if len(query_variants) > 1 and torch.is_grad_enabled():
+            raise ValueError('paired query variants are evaluation-only')
         ctl.reset_episode(episode_id, latent.shape[0])
         bounds = chunk_boundaries(latent.shape[2])
         chunks = len(bounds) - 1
@@ -47,6 +79,7 @@ class GrailEpisodeModel(nn.Module):
         caches = SelfForcingFlowEulerCamCtrl._initialize_kv_cache(holder, chunks)
         rng = torch.Generator(device=latent.device).manual_seed(seed)
         associations = []
+        memory_trace = []
         for chunk in range(chunks):
             start, end = bounds[chunk:chunk + 2]
             cache = clone_cache(SelfForcingFlowEulerCamCtrl._accumulate_softmax_kv_cache(holder, caches, chunk)[0])
@@ -63,15 +96,37 @@ class GrailEpisodeModel(nn.Module):
                 noise = torch.randn(clean.shape, device=clean.device, dtype=clean.dtype, generator=query_rng)
                 noisy = (1 - sigma) * clean + sigma * noise
                 times = (1000 * sigma).expand(clean.shape[0], 1, end - start)
-                context = ctl.context('frozen', sigma=times / 1000., chunk_id=chunk)
+                query_input_fingerprint = (input_fingerprint(noisy, times, kwargs['camera_conditions'],
+                                                            kwargs.get('chunk_plucker'), text, mask)
+                                           if record_trace else None)
                 cursor = ctl.state.last_committed_chunk.clone()
-                prediction, _ = model(noisy, times, kv_cache=cache, save_kv_cache=False, grail_context=context, **kwargs)
-                if context.observations or not torch.equal(cursor, ctl.state.last_committed_chunk):
-                    raise RuntimeError('held-out future query must be read-only')
-                future = (prediction.float() - (noise - clean).float()).square().mean()
+                variant_future, variant_hook_counts, variant_gate_mean, variant_slot_coverage = {}, {}, {}, {}
+                query_context = None
+                reference_gates = None
+                for variant in ('ridge', *(name for name in query_variants if name != 'ridge')):
+                    context = ctl.context('frozen', sigma=times / 1000., chunk_id=chunk, read_variant=variant,
+                                          gate_overrides=reference_gates)
+                    prediction, _ = model(noisy, times, kv_cache=clone_cache(cache), save_kv_cache=False,
+                                          grail_context=context, **kwargs)
+                    if context.observations or not torch.equal(cursor, ctl.state.last_committed_chunk):
+                        raise RuntimeError('held-out future query must be read-only')
+                    variant_future[variant] = (prediction.float() - (noise - clean).float()).square().mean()
+                    variant_hook_counts[variant] = dict(context.call_counts)
+                    if record_trace:
+                        variant_gate_mean[variant] = float(torch.stack([
+                            g.detach().float().mean() for g in context.gates.values()]).mean())
+                        variant_slot_coverage[variant] = float(torch.stack([
+                            slots.valid.any(-1).float().mean() for slots in context.slot_reads]).mean())
+                    if variant == 'ridge':
+                        query_context = context
+                        reference_gates = {layer: gate.detach() for layer, gate in context.gates.items()}
+                future = variant_future['ridge']
                 association = torch.stack(associations).mean()
                 return dict(loss=future + self.association_weight * association, future=future,
-                            association=association, query_context=context, support_chunks=chunk)
+                            association=association, query_context=query_context, support_chunks=chunk,
+                            variant_future=variant_future, variant_hook_counts=variant_hook_counts,
+                            variant_gate_mean=variant_gate_mean, variant_slot_coverage=variant_slot_coverage,
+                            memory_trace=memory_trace, query_input_fingerprint=query_input_fingerprint)
             real_frames = tuple(range(end - start))
             if generated:
                 real_frames = (0,) if chunk == 0 else ()
@@ -100,8 +155,12 @@ class GrailEpisodeModel(nn.Module):
             _, updated_cache = model(clean, clean.new_zeros(clean.shape[0]), kv_cache=cache, save_kv_cache=True,
                                      grail_context=context, **kwargs)
             associations.append(ctl.ledger.association_loss(context.observations[0]))
-            if not ctl.commit_clean(context, chunk)['committed']:
+            before = ctl.state if record_trace else None
+            report = ctl.commit_clean(context, chunk, trace_route=record_trace)
+            if not report['committed']:
                 raise FloatingPointError('GRAIL training write rejected')
+            if record_trace:
+                memory_trace.append(_memory_trace_row(before, ctl.state, context.observations[0], report))
             # The outer temporal gradient is through the ledger, not native KV.
             caches[chunk] = clone_cache(updated_cache)
             if self.detach_every and (chunk + 1) % self.detach_every == 0 and chunk + 1 < chunks - 1:

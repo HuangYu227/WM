@@ -37,7 +37,8 @@ def sparse_attention(q, k, v, bias, heads):
     q = q.reshape(b * n, heads, 1, dh)
     k = k.reshape(b * n, length, heads, dh).transpose(1, 2)
     v = v.reshape(b * n, length, heads, dh).transpose(1, 2)
-    out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias.reshape(b * n, 1, 1, length), dropout_p=0.)
+    mask = bias.reshape(b * n, 1, 1, length).to(q.dtype)
+    out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.)
     return out.reshape(b, n, d)
 
 
@@ -115,7 +116,7 @@ class SparseMemoryReader(nn.Module):
         self.gate = nn.Sequential(nn.Linear(2 * w + 4, 64), nn.SiLU(), nn.Linear(64, 1))
         nn.init.constant_(self.gate[-1].bias, -2.)
 
-    def forward(self, x, slots, sigma, visibility):
+    def forward(self, x, slots, sigma, visibility, gate_override=None):
         outputs, gates = [], []
         for start in range(0, x.shape[1], self.network.query_block):
             end = start + self.network.query_block
@@ -132,7 +133,8 @@ class SparseMemoryReader(nn.Module):
             margin = slots.margin[:, start:end].clamp(0, 20) / 20
             time = sigma[:, start:end, 0].to(confidence.dtype)
             diag = torch.stack((time, confidence, uncertainty, margin), dim=-1).to(q.dtype)
-            gate = self.gate(torch.cat((q, message, diag), -1)).sigmoid()
+            gate = (self.gate(torch.cat((q, message, diag), -1)).sigmoid()
+                    if gate_override is None else gate_override[:, start:end].to(q.dtype))
             gate = gate * valid.any(-1, keepdim=True) * visibility[:, start:end]
             outputs.append(self.output(message) * gate)
             gates.append(gate)
