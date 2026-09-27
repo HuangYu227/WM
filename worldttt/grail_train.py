@@ -1,6 +1,8 @@
 """Canonical GRAIL outer training: support association + read-only future flow."""
 import json
 import os
+import random
+import time
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -168,16 +170,43 @@ class GrailEpisodeModel(nn.Module):
         raise AssertionError('missing future query')
 
 
-def train_step(module, optimizer, batch, *, generated=False, seed=0):
+def gradient_report(named_parameters, gradients):
+    """Per-submodule norms; unused parameters remain distinguishable from zero gradients."""
+    report = {}
+    for (name, _), gradient in zip(named_parameters, gradients):
+        group = name.rsplit('.', 1)[0]
+        row = report.setdefault(group, dict(parameters=0, with_gradient=0, nonzero=0, squared_norm=0.))
+        row['parameters'] += 1
+        if gradient is not None:
+            norm2 = float(gradient.detach().float().square().sum())
+            row['with_gradient'] += 1
+            row['nonzero'] += int(norm2 > 0)
+            row['squared_norm'] += norm2
+    for row in report.values():
+        row['norm'] = row.pop('squared_norm') ** .5
+    return report
+
+
+def train_step(module, optimizer, batch, *, generated=False, seed=0, diagnostics=False):
     optimizer.zero_grad(set_to_none=True)
     result = module(**batch, generated=generated, seed=seed)
     if not torch.isfinite(result['loss']):
         raise FloatingPointError('nonfinite GRAIL loss')
+    diagnostics_row = {}
+    named = [(name, p) for name, p in module.controller.named_parameters() if p.requires_grad] if diagnostics else []
+    if diagnostics:
+        future_grads = torch.autograd.grad(result['future'], [p for _, p in named],
+                                           retain_graph=True, allow_unused=True)
+        diagnostics_row['future_gradients'] = gradient_report(named, future_grads)
+        del future_grads
     result['loss'].backward()
+    if diagnostics:
+        diagnostics_row['total_gradients'] = gradient_report(named, [p.grad for _, p in named])
     parameters = [p for p in module.parameters() if p.requires_grad]
     norm = torch.nn.utils.clip_grad_norm_(parameters, 1., error_if_nonfinite=True)
     optimizer.step()
-    return {name: float(result[name].detach()) for name in ('loss', 'future', 'association')} | {'gradient_norm': float(norm)}
+    return ({name: float(result[name].detach()) for name in ('loss', 'future', 'association')}
+            | {'gradient_norm': float(norm)} | diagnostics_row)
 
 
 def train(settings, output, adapter=None):
@@ -190,6 +219,9 @@ def train(settings, output, adapter=None):
         raise ValueError('this trainer currently supports one GPU; do not launch it with multi-rank torchrun')
     device = torch.device('cuda')
     torch.manual_seed(settings.get('seed', 3407))
+    random.seed(settings.get('seed', 3407))
+    import numpy as np
+    np.random.seed(settings.get('seed', 3407))
     pipe = make_pipeline(load_config(settings['sana_config']), settings['base_checkpoint'], device, training=True)
     if adapter:
         ctl, _ = load_grail_adapter(pipe.model, adapter, base_checkpoint_hash=file_sha256(settings['base_checkpoint']))
@@ -211,19 +243,45 @@ def train(settings, output, adapter=None):
     output.mkdir(parents=True, exist_ok=True)
     data = EpisodeDataset(settings['data'], settings['manifest'], 'train', frames=settings.get('frames', 121))
     validation = EpisodeDataset(settings['data'], settings['manifest'], 'val', frames=settings.get('frames', 121))
+    training_metadata = dict(base_checkpoint_sha256=ctl.base_checkpoint_hash,
+        manifest_sha256=file_sha256(settings['manifest']), settings=settings,
+        train_scenes=len({r['scene_id'] for r in data.rows}), train_clips=len(data),
+        val_scenes=len({r['scene_id'] for r in validation.rows}),
+        adapter_parameters=sum(p.numel() for p in ctl.parameters()),
+        trainable_parameters=sum(p.numel() for p in ctl.parameters() if p.requires_grad),
+        warm_start=str(adapter) if adapter else None, optimizer_resumed=False)
+    (output / 'training_metadata.json').write_text(json.dumps(training_metadata, indent=2), encoding='utf-8')
+    order_rng = torch.Generator().manual_seed(settings.get('seed', 3407))
+    order = list(range(len(data)))
     best = float('inf')
     for step in range(settings.get('max_steps', 1000)):
-        fixture = make_fixture(data[step % len(data)], pipe, device)
+        if step % len(data) == 0 and settings.get('shuffle_train', False):
+            order = torch.randperm(len(data), generator=order_rng).tolist()
+        data_index = order[step % len(data)]
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        fixture = make_fixture(data[data_index], pipe, device)
         curriculum = settings.get('curriculum', [[0, 4], [250, 12], [500, 24], [750, 40]])
         active_chunks = max(chunks for threshold, chunks in curriculum if step >= threshold)
         frames = min(fixture['latent'].shape[2], active_chunks * 3 + 1)
         fixture['latent'], fixture['camera'] = fixture['latent'][:, :, :frames], fixture['camera'][:, :frames]
         fixture['plucker'] = fixture['plucker'][:, :, :frames]
         generated = step >= settings.get('real_prefix_steps', 250) and step % 2 == 1
-        row = train_step(module, optimizer, fixture, generated=generated, seed=settings.get('seed', 3407) + step)
-        row.update(step=step + 1, generated=generated, frames=frames)
+        every = int(settings.get('diagnostics_every', 0))
+        diagnostic_step = every > 0 and (step == 0 or (step + 1) % every == 0)
+        row = train_step(module, optimizer, fixture, generated=generated, seed=settings.get('seed', 3407) + step,
+                         diagnostics=diagnostic_step)
+        torch.cuda.synchronize()
+        row.update(step=step + 1, generated=generated, frames=frames,
+                   scene_id=data.rows[data_index]['scene_id'], key=data.rows[data_index]['key'],
+                   latent_shape=list(fixture['latent'].shape),
+                   step_seconds_including_data_and_text=time.perf_counter() - started,
+                   peak_allocated_gib=torch.cuda.max_memory_allocated() / 2**30,
+                   peak_reserved_gib=torch.cuda.max_memory_reserved() / 2**30)
         with (output / 'train.jsonl').open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(row) + '\n')
+        print(json.dumps({k: v for k, v in row.items() if not k.endswith('_gradients')}), flush=True)
         if (step + 1) % settings.get('save_every', 100) == 0 or step + 1 == settings.get('max_steps', 1000):
             with torch.no_grad():
                 validation_losses = []

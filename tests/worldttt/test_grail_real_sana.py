@@ -119,6 +119,18 @@ def test_paired_future_query_uses_one_history_and_read_only_variants():
     assert generated['query_input_fingerprint'] == result['query_input_fingerprint']
 
 
+def test_real_sana_future_gradient_logging():
+    from worldttt.grail_train import GrailEpisodeModel, train_step
+    model = make_model()
+    ctl = attach(model)
+    module = GrailEpisodeModel(model, steps=2)
+    optimizer = torch.optim.AdamW([p for p in ctl.parameters() if p.requires_grad], lr=1e-4)
+    row = train_step(module, optimizer, fixture(), diagnostics=True)
+    for name in ('writer.address', 'writer.value', 'writer.write_gate.0', 'readers.15.query'):
+        assert row['future_gradients'][name]['norm'] > 0
+    assert all(torch.isfinite(p).all() for p in ctl.parameters())
+
+
 def sampler(model, batch, cfg=2.):
     from diffusion.scheduler.self_forcing_flow_euler_sampler import SelfForcingFlowEulerCamCtrl
     return SelfForcingFlowEulerCamCtrl(model, batch['text'], batch['text'] * 0, cfg,

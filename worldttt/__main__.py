@@ -18,6 +18,8 @@ def main():
         if name in {'train', 'grail-train', 'grail-experiment', 'infer', 'evaluate', 'query-eval'}:
             cmd.add_argument('--adapter', required=name == 'grail-experiment')
         if name == 'grail-experiment':
+            cmd.add_argument('--cases', help='Camera-selected windows from worldttt.grail_long prepare; overrides --samples')
+            cmd.add_argument('--seeds', nargs='+', type=int, help='Paired query seeds; clips and seeds are not independent scenes')
             cmd.add_argument('--split', choices=['val', 'test'], default='val')
             cmd.add_argument('--samples', type=int, default=4, help='One clip from each of this many scenes')
             cmd.add_argument('--frames', type=int, help='Exact latent-frame count; at least 10')
@@ -66,7 +68,8 @@ def main():
     elif args.command == 'grail-experiment':
         from .grail_experiment import run_experiment
         run_experiment(settings, args.adapter, args.output, split=args.split, samples=args.samples,
-                       frames=args.frames, histories=args.histories, variants=args.variants)
+                       frames=args.frames, histories=args.histories, variants=args.variants,
+                       case_file=args.cases, seeds=args.seeds)
     elif args.command == 'train':
         from .check_cache import require_gate
         from .train import train
